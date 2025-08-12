@@ -142,6 +142,22 @@ def _eos_ids(proc: Qwen2_5OmniProcessor) -> List[int]:
     # 去重
     return list(dict.fromkeys(ids))
 
+def _append_assistant_prefill(proc, model_device, inputs_dict, prefill_text: str):
+    """
+    在 <|im_start|>assistant 後面補一段前綴（例如 'Transcript: '），
+    讓模型沿這個格式往下生成。這不是 stop word。
+    """
+    tok = proc.tokenizer
+    pre_ids = tok.encode(prefill_text, add_special_tokens=False, return_tensors="pt")
+    pre_ids = pre_ids.to(model_device)
+
+    # 拼到 input_ids 後面，mask 也要一起補 1
+    inputs_dict["input_ids"] = torch.cat([inputs_dict["input_ids"], pre_ids], dim=1)
+    if "attention_mask" in inputs_dict:
+        add_mask = torch.ones_like(pre_ids, dtype=inputs_dict["attention_mask"].dtype)
+        inputs_dict["attention_mask"] = torch.cat([inputs_dict["attention_mask"], add_mask], dim=1)
+    return inputs_dict
+
 # ========= 音訊 I/O 與增益 =========
 def _db_to_amp(db): return 10 ** (db / 20.0)
 
@@ -328,13 +344,18 @@ def _merge_texts_with_overlap(pieces: List[str], min_overlap_chars: int = 10, ma
                 out = prev + cur_n
     return out.strip()
 
-# ========= 單段推論（官方 system + user: audio only） =========
+# ========= 單段推論（軟性指示 + assistant prefill） =========
 def _transcribe_once(wav_path: str, proc: Qwen2_5OmniProcessor, model, max_new_tokens: int) -> str:
     default_system = ("You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
                       "capable of perceiving auditory and visual inputs, as well as generating text and speech.")
+
+    # 軟性 ASR 指示（避免嚴格規則導致 [NO-SPEECH]）
     conversations = [
         {"role": "system", "content": [{"type": "text", "text": default_system}]},
-        {"role": "user",   "content": [{"type": "audio", "path": wav_path}]},  # 音訊而已，不加文字
+        {"role": "user",   "content": [
+            {"type": "audio", "path": wav_path},
+            {"type": "text",  "text": "Please transcribe the audio verbatim. Output only the spoken words, no commentary."}
+        ]},
     ]
 
     inputs = proc.apply_chat_template(
@@ -346,6 +367,9 @@ def _transcribe_once(wav_path: str, proc: Qwen2_5OmniProcessor, model, max_new_t
         padding=True
     ).to(model.device)
 
+    # 在 assistant 起手加 prefill，拉回「逐字稿」格式
+    inputs = _append_assistant_prefill(proc, model.device, inputs, "Transcript: ")
+
     out_ids = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
@@ -354,9 +378,15 @@ def _transcribe_once(wav_path: str, proc: Qwen2_5OmniProcessor, model, max_new_t
         pad_token_id=proc.tokenizer.eos_token_id,
     )
 
+    # 只解碼新增段
     gen_only = out_ids[:, inputs["input_ids"].shape[1]:]
-    text = proc.batch_decode(gen_only, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-    return text.strip()
+    text = proc.batch_decode(gen_only, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip()
+
+    # 輕度清理：去除我們的前綴
+    if text.lower().startswith("transcript:"):
+        text = text[len("transcript:"):].lstrip()
+
+    return text
 
 # ========= API =========
 @app.post("/audio/transcribe")
