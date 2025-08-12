@@ -34,21 +34,7 @@ from transformers import (
 
 load_dotenv()
 
-# 停止條件類別：避免輸出對話標籤和續寫提示
-class StopOnStrings(StoppingCriteria):
-    def __init__(self, tokenizer, stop_strings):
-        self.tokenizer = tokenizer
-        self.stop_strings = stop_strings
-        self.generated = ""
 
-    def __call__(self, input_ids, scores, **kwargs):
-        # 只解碼新增部分，避免每步全量解碼
-        new_text = self.tokenizer.decode(input_ids[0][-1:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        self.generated += new_text
-        for s in self.stop_strings:
-            if self.generated.endswith(s):
-                return True
-        return False
 
 # 設定 Transformers 詳細程度以避免警告
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -128,6 +114,22 @@ def _load_processor():
         logger.info("載入 Qwen2_5OmniProcessor ...")
         processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
         logger.info("Processor 載入完成")
+
+def _special_ids(proc):
+    tok = proc.tokenizer
+    im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
+    # 兼容：有些板本 eos_token_id 可能與 im_end 不同，兩個都當作可終止
+    eos_ids = [tok.eos_token_id] if tok.eos_token_id is not None else []
+    if im_end_id is not None:
+        eos_ids.append(im_end_id)
+    # 常見噪聲片段（可視情況增補）
+    stop_phrases = [
+        "Human:", "HUMAN:", "Human's question:", "User:", "Assistant:", "System:",
+        "請續寫下面這段話", "请续写下面这段话", "繼續", "继续"
+    ]
+    # 轉成 stop_words_ids（每個是 token id 序列）
+    stop_words_ids = [proc.tokenizer.encode(s, add_special_tokens=False) for s in stop_phrases]
+    return eos_ids, stop_words_ids
 
 def _load_thinker_model():
     global thinker_model
@@ -281,7 +283,8 @@ def _write_wav_segment(audio: np.ndarray, sr: int, seg: Tuple[int, int]) -> str:
 
 def _qwen_transcribe_wav(wav_path: str, model, proc, max_new_tokens: int) -> str:
     """
-    單段轉錄（保留官方 system prompt；user 內加嚴格 ASR 指示；加入停止準則）
+    純 ASR：保留官方 system，不改；在 user 裡下嚴格指示 + 要求 JSON 輸出；
+    用 eos_token_id 讓生成在 <|im_end|> 即停，並用 stop_words_ids 擋常見噪聲前綴。
     """
     conversations = [
         {
@@ -300,12 +303,13 @@ def _qwen_transcribe_wav(wav_path: str, model, proc, max_new_tokens: int) -> str
                 {
                     "type": "text",
                     "text": (
-                        "ASR task: Transcribe the audio verbatim. "
-                        "Output ONLY the words actually spoken in the audio. "
-                        "Do NOT include any extra text, explanations, labels, or role tags such as 'Human:', 'HUMAN:', "
-                        "'User:', 'Assistant:', 'System:'. "
-                        "Do NOT invent, continue, or request to 'continue writing'. "
-                        "If there is non-speech or silence only, return [NO-SPEECH]."
+                        "ASR task: Transcribe the audio verbatim.\n"
+                        "Rules:\n"
+                        "1) Output ONLY the words actually spoken in the audio.\n"
+                        "2) No extra text, no explanations, no role tags (e.g., Human:, Assistant:, System:),\n"
+                        "   no prompts like 'continue writing'.\n"
+                        "3) If there is no speech, output exactly: [NO-SPEECH].\n"
+                        "4) Return a single-line JSON object: {\"text\": \"<TRANSCRIPT>\"} with no trailing text."
                     )
                 },
             ],
@@ -314,34 +318,50 @@ def _qwen_transcribe_wav(wav_path: str, model, proc, max_new_tokens: int) -> str
 
     inputs = proc.apply_chat_template(
         conversations,
-        add_generation_prompt=True,   # 依官方範例維持 True
+        add_generation_prompt=True,   # 依模板要求，在最後補 <|im_start|>assistant\n
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
         padding=True
     ).to(model.device)
 
-    # 停止條件：一旦模型開始產生對話式標籤或續寫提示，就立刻停
-    stop_strings = [
-        "\nHuman:", "Human:", "\nHUMAN", "HUMAN:",
-        "\nUser:", "User:",
-        "\nAssistant:", "Assistant:", "ASSISTANT:",
-        "\nSystem:", "System:",
-        "请续写下面这段话", "請續寫下面這段話", "請繼續", "继续", "續寫"
-    ]
-    stopping_criteria = StoppingCriteriaList([StopOnStrings(proc.tokenizer, stop_strings)])
+    eos_ids, stop_words_ids = _special_ids(proc)
 
     out_ids = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
-        do_sample=False,             # 穩定、可重現
-        temperature=0.0,
-        repetition_penalty=1.05,     # 抑制重複段落（可視需要調整/移除）
-        stopping_criteria=stopping_criteria
+        do_sample=False,                 # 穩定輸出
+        eos_token_id=eos_ids,           # **關鍵**：遇到 <|im_end|> 或 eos 即停
+        stop_words_ids=stop_words_ids,  # 擋掉常見噪聲開頭（可再擴充）
+        repetition_penalty=1.05
     )
 
-    text = proc.batch_decode(out_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-    return text.strip()
+    # 只取新生成部分（避免把 prompt 一起解碼）
+    gen_only = out_ids[:, inputs["input_ids"].shape[1]:]
+    text = proc.batch_decode(gen_only, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip()
+
+    # 只允許 JSON。一些模型可能仍夾雜前綴，這裡做穩健抽取。
+    # 簡單做法：抓第一個 {...} 區塊。
+    import re, json
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    if m:
+        candidate = m.group(0)
+        try:
+            obj = json.loads(candidate)
+            out = obj.get("text", "").strip()
+            return out
+        except Exception:
+            pass
+
+    # fallback：把常見噪聲行清掉
+    noise_prefixes = ("Human:", "HUMAN:", "Human's question:", "User:", "Assistant:", "System:")
+    cleaned = []
+    for line in text.splitlines():
+        if any(line.strip().startswith(p) for p in noise_prefixes):
+            continue
+        cleaned.append(line)
+    cleaned_text = " ".join(" ".join(cleaned).split()).strip()
+    return cleaned_text
 
 def _normalize_ws(s: str) -> str:
     return " ".join(s.split())
