@@ -259,20 +259,19 @@ def _write_wav_segment(audio: np.ndarray, sr: int, seg: Tuple[int, int]) -> str:
     sf.write(tmp_path, segment, sr)
     return tmp_path
 
-def _qwen_transcribe_wav(wav_path: str, prompt: str, model, proc, max_new_tokens: int) -> str:
-    """呼叫 Qwen Thinker 對單一 WAV 轉錄。"""
+def _qwen_transcribe_wav(wav_path: str, model, proc, max_new_tokens: int) -> str:
+    """呼叫 Qwen Thinker 對單一 WAV 轉錄（純 ASR 模式）"""
     conversations = [
         {
             "role": "system",
             "content": [
-                {"type": "text", "text": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."}
+                {"type": "text", "text": "You are a speech-to-text model. Output only the exact transcription of the audio without any additional comments or dialogue."}
             ],
         },
         {
             "role": "user",
             "content": [
-                {"type": "audio", "path": wav_path},
-                {"type": "text", "text": prompt},
+                {"type": "audio", "path": wav_path}
             ],
         },
     ]
@@ -283,8 +282,7 @@ def _qwen_transcribe_wav(wav_path: str, prompt: str, model, proc, max_new_tokens
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
-        padding=True,
-        use_audio_in_video=True,
+        padding=True
     ).to(model.device)
 
     # 根據模型類型自動選擇參數
@@ -344,7 +342,6 @@ def _merge_texts_with_overlap(pieces: List[str], min_overlap_chars: int = 10, ma
 @app.post("/audio/transcribe")
 async def transcribe_audio(
     file: UploadFile = File(...),
-    prompt_message: str = "請逐字轉錄音檔中可聽見的語音內容，不要加入其他說明。",
     max_new_tokens: int = MAX_NEW_TOKENS,
 ):
     """
@@ -397,7 +394,7 @@ async def transcribe_audio(
             for i, seg in enumerate(final_segs, 1):
                 wav_path = _write_wav_segment(audio, sr, seg)
                 tmp_paths.append(wav_path)
-                seg_text = _qwen_transcribe_wav(wav_path, prompt_message, thinker_model, processor, max_new_tokens)
+                seg_text = _qwen_transcribe_wav(wav_path, thinker_model, processor, max_new_tokens)
                 texts.append(seg_text)
                 logger.debug("段 %d 轉錄字數=%d", i, len(seg_text))
         finally:
