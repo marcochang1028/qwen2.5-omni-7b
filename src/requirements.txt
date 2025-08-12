@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+transformers
+python-dotenv
+librosa==0.10.2
+python-multipart
