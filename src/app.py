@@ -189,7 +189,7 @@ def _resample_for_vad(y: np.ndarray, sr: int, target_sr: int = 16000) -> np.ndar
         return y
     if sr == target_sr:
         return y.astype(np.float32)
-    return librosa.resample(y, orig_sr=sr, target_sr=target_sr, res_type="kaiser_best").astype(np.float32)
+    return librosa.resample(y, orig_sr=sr, target_sr=target_sr, res_type="polyphase").astype(np.float32)
 
 def _float32_to_pcm16(x: np.ndarray) -> bytes:
     x = np.clip(x, -1.0, 1.0)
