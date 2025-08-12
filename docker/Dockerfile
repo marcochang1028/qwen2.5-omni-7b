@@ -9,7 +9,7 @@ COPY ../src/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # 4. 安裝 Flash Attention 2 (可選，用於加速生成)
-RUN pip install -U flash-attn --no-build-isolation
+#RUN pip install -U flash-attn --no-build-isolation
 
 # 5. 將當前目錄的內容複製到工作目錄中
 COPY ../src /app
