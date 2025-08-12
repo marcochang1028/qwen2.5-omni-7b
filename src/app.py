@@ -287,12 +287,23 @@ def _qwen_transcribe_wav(wav_path: str, prompt: str, model, proc, max_new_tokens
         use_audio_in_video=True,
     ).to(model.device)
 
-    out_ids = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        thinker_do_sample=False,
-        thinker_temperature=0.0,
-    )
+    # 根據模型類型自動選擇參數
+    if isinstance(model, Qwen2_5OmniThinkerForConditionalGeneration):
+        # Thinker-only 模型：使用標準參數
+        out_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=0.0,
+        )
+    else:
+        # 全 Omni 模型：使用 thinker_* 參數
+        out_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            thinker_do_sample=False,
+            thinker_temperature=0.0,
+        )
 
     text = proc.batch_decode(out_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
     return text.strip()
