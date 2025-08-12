@@ -1,5 +1,5 @@
 # 1. 使用包含 CUDA 開發工具的 Docker Image
-FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.6.0-cuda12.1-cudnn8-runtime
 
 # 2. 設定工作目錄
 WORKDIR /app
