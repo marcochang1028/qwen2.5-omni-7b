@@ -5,471 +5,153 @@ import time
 import gc
 import tempfile
 from io import BytesIO
-from typing import List, Tuple
 
-import numpy as np
 import soundfile as sf
-import webrtcvad
 import torch
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+from transformers import Qwen2_5OmniProcessor, Qwen2_5OmniThinkerForConditionalGeneration
 
-from transformers import (
-    Qwen2_5OmniProcessor,
-    Qwen2_5OmniThinkerForConditionalGeneration,
-    StoppingCriteria, StoppingCriteriaList,
-)
-
-# ===============================
-# Qwen2.5-Omni-7B ASR 專注強化版
-# - 只用 Thinker（文字輸出）。無 Talker、無語音回覆。
-# - 正確多模態餵法：apply_chat_template + {"type":"audio","path":...}
-# - VAD 語音端點偵測：webrtcvad（16k/mono/16-bit PCM）
-# - 長段落安全切片：max_seg_sec + seg_overlap_sec
-# - 文字智慧合併：段與段的重疊去重（suffix/prefix 比對）
-# - 生成：thinker_do_sample=False（穩定）
-# - 空閒釋放：GPU/記憶體清理
-# ===============================
-
+# ===== Basic setup =====
 load_dotenv()
-
-
-
-# 設定 Transformers 詳細程度以避免警告
-os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-log_format = os.getenv("LOG_FORMAT", "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logging.basicConfig(level=log_level, format=log_format, force=True)
-logger = logging.getLogger("qwen2.5-omni-asr-vad")
+logging.basicConfig(level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", force=True)
+logger = logging.getLogger("qwen2.5-omni-asr-basic")
 
 HF_TOKEN = os.getenv("HUGGINGFACE_API_KEY")
 if not HF_TOKEN:
     raise RuntimeError("HUGGINGFACE_API_KEY 未設定")
 
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-Omni-7B")
-
-# ====== VAD 與切片參數 ======
-# VAD aggressiveness: 0(最寬鬆)~3(最嚴格)。越大越容易切斷噪音/弱音。
-VAD_AGGR = int(os.getenv("ASR_VAD_AGGR", "2"))
-
-# VAD 分段合併條件
-MIN_SPEECH_SEC   = float(os.getenv("ASR_MIN_SPEECH_SEC", "0.3"))   # 小於此長度的語音段丟掉
-MAX_SILENCE_SEC  = float(os.getenv("ASR_MAX_SILENCE_SEC", "0.5"))  # 中間靜音 <= 這個就把段合併
-PAD_SEC          = float(os.getenv("ASR_PAD_SEC", "0.2"))          # 每段前後補一點，減少截字
-
-# 若單一 VAD 段過長，再次切片避免一次生成過長
-MAX_SEG_SEC      = float(os.getenv("ASR_MAX_SEG_SEC", "45.0"))  # 單段最多秒數
-SEG_OVERLAP_SEC  = float(os.getenv("ASR_SEG_OVERLAP_SEC", "1.0"))
-
-# 生成參數
-MAX_NEW_TOKENS   = int(os.getenv("ASR_MAX_NEW_TOKENS", "512"))
-
-# 閒置釋放
-IDLE_TIMEOUT     = int(os.getenv("IDLE_TIMEOUT", "300"))
-last_used_time   = None
-timeout_thread   = None
+IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))
 
 app = FastAPI()
-
 processor = None
-thinker_model = None
+thinker = None
+last_used_time = None
+timeout_thread = None
 
-# -------------------- 工具函式 --------------------
-def _touch_last_used():
+# ===== Helpers =====
+def _touch():
     global last_used_time
     last_used_time = time.time()
 
-def monitor_idle_time():
-    global processor, thinker_model, last_used_time
+def _idle_monitor():
+    global processor, thinker, last_used_time
     while True:
         time.sleep(10)
         if last_used_time and (time.time() - last_used_time > IDLE_TIMEOUT):
-            logger.info("模型閒置超時，釋放 GPU/CPU 記憶體...")
             try:
-                if thinker_model is not None:
-                    del thinker_model
-                if processor is not None:
-                    del processor
+                if thinker is not None: del thinker
+                if processor is not None: del processor
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     torch.cuda.ipc_collect()
             finally:
-                thinker_model = None
+                thinker = None
                 processor = None
                 last_used_time = None
-                logger.info("資源釋放完成")
+                logger.info("資源已釋放")
 
-def start_timeout_monitor():
+def _start_monitor_once():
     global timeout_thread
     if timeout_thread is None:
-        timeout_thread = threading.Thread(target=monitor_idle_time, daemon=True)
+        timeout_thread = threading.Thread(target=_idle_monitor, daemon=True)
         timeout_thread.start()
 
-def _load_processor():
+def _load_proc():
     global processor
     if processor is None:
-        logger.info("載入 Qwen2_5OmniProcessor ...")
+        logger.info("載入 Processor ...")
         processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
         logger.info("Processor 載入完成")
 
-def _special_ids(proc):
-    tok = proc.tokenizer
-    im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
-    # 兼容：有些板本 eos_token_id 可能與 im_end 不同，兩個都當作可終止
-    eos_ids = [tok.eos_token_id] if tok.eos_token_id is not None else []
-    if im_end_id is not None:
-        eos_ids.append(im_end_id)
-    # 常見噪聲片段（可視情況增補）
-    stop_phrases = [
-        "Human:", "HUMAN:", "Human's question:", "User:", "Assistant:", "System:",
-        "請續寫下面這段話", "请续写下面这段话", "繼續", "继续"
-    ]
-    # 轉成 stop_words_ids（每個是 token id 序列）
-    stop_words_ids = [proc.tokenizer.encode(s, add_special_tokens=False) for s in stop_phrases]
-    return eos_ids, stop_words_ids
-
-def _load_thinker_model():
-    global thinker_model
-    if thinker_model is None:
-        logger.info("載入 Thinker（text-only）模型 ...")
-        thinker_model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
-            MODEL_NAME,
-            torch_dtype="auto",
-            device_map="auto",
-            token=HF_TOKEN,
+def _load_thinker():
+    global thinker
+    if thinker is None:
+        logger.info("載入 Thinker 模型 ...")
+        thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+            MODEL_NAME, torch_dtype="auto", device_map="auto", token=HF_TOKEN
         )
         logger.info("Thinker 模型載入完成")
 
-def _bytes_to_audio(data: bytes) -> Tuple[np.ndarray, int]:
-    """讀取任意格式到 (mono float32, sr)。"""
+def _bytes_to_wav_path(data: bytes) -> str:
+    # 讀任何格式 -> 單聲道 WAV，交給 Processor 做該做的事
     audio, sr = sf.read(BytesIO(data), dtype="float32", always_2d=False)
-    if audio.ndim > 1:
+    if hasattr(audio, "ndim") and audio.ndim > 1:
         audio = audio.mean(axis=1)
-    return audio, sr
+    fd, path = tempfile.mkstemp(suffix=".wav"); os.close(fd)
+    sf.write(path, audio, sr)
+    return path
 
-def _resample_mono_float32(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """簡單線性內插重取樣（僅用於 VAD，品質足夠）。"""
-    if orig_sr == target_sr:
-        return audio.astype(np.float32)
-    n_target = int(round(len(audio) * target_sr / orig_sr))
-    if n_target <= 1 or len(audio) <= 1:
-        return np.zeros(0, dtype=np.float32)
-    x_old = np.linspace(0.0, 1.0, num=len(audio), endpoint=True)
-    x_new = np.linspace(0.0, 1.0, num=n_target, endpoint=True)
-    resampled = np.interp(x_new, x_old, audio).astype(np.float32)
-    return resampled
-
-def _float32_to_pcm16(x: np.ndarray) -> bytes:
-    """float32(-1~1) -> int16 PCM bytes。"""
-    x = np.clip(x, -1.0, 1.0)
-    return (x * 32767.0).astype(np.int16).tobytes()
-
-def _frame_generator(pcm16: bytes, sample_rate: int, frame_ms: int = 20):
-    """產生固定幀長的 bytes 片段給 webrtcvad（20ms/10ms/30ms 任一）。"""
-    n = int(sample_rate * (frame_ms / 1000.0)) * 2  # 2 bytes/sample
-    for i in range(0, len(pcm16), n):
-        chunk = pcm16[i:i+n]
-        if len(chunk) == n:
-            yield chunk
-
-def _vad_segments(audio: np.ndarray, sr: int) -> List[Tuple[int, int]]:
-    """
-    用 webrtcvad 產生語音區間（在 16k/mono/16-bit PCM 上運作）。
-    回傳: 在 16k 的 sample index 的 (start, end) 清單。
-    """
-    target_sr = 16000
-    vad = webrtcvad.Vad(VAD_AGGR)
-
-    # 轉到 16k mono
-    audio_16k = _resample_mono_float32(audio, sr, target_sr)
-    if audio_16k.size == 0:
-        return []
-
-    pcm16 = _float32_to_pcm16(audio_16k)
-
-    frame_ms = 20
-    frames = list(_frame_generator(pcm16, target_sr, frame_ms))
-    if not frames:
-        return []
-
-    # 將每幀標記是否有聲
-    voiced = [vad.is_speech(f, target_sr) for f in frames]
-    frame_len_samples = int(target_sr * (frame_ms / 1000.0))
-
-    segs: List[Tuple[int, int]] = []
-    in_speech = False
-    start_idx = 0
-    last_voiced_idx = -1
-
-    max_silence_frames = int(MAX_SILENCE_SEC / (frame_ms / 1000.0))
-    min_speech_frames = max(1, int(MIN_SPEECH_SEC / (frame_ms / 1000.0)))
-
-    for i, v in enumerate(voiced):
-        if v and not in_speech:
-            # 進入語音段
-            in_speech = True
-            start_idx = i
-            last_voiced_idx = i
-        elif v and in_speech:
-            last_voiced_idx = i
-        elif (not v) and in_speech:
-            # 靜音中，但先不立刻結束，看靜音累積
-            if (i - last_voiced_idx) > max_silence_frames:
-                # 結束語音段
-                length_frames = last_voiced_idx - start_idx + 1
-                if length_frames >= min_speech_frames:
-                    seg_start = start_idx * frame_len_samples
-                    seg_end = (last_voiced_idx + 1) * frame_len_samples
-                    segs.append((seg_start, seg_end))
-                in_speech = False
-
-    # 收尾：若結束時仍在語音段
-    if in_speech:
-        length_frames = last_voiced_idx - start_idx + 1
-        if length_frames >= min_speech_frames:
-            seg_start = start_idx * frame_len_samples
-            seg_end = (last_voiced_idx + 1) * frame_len_samples
-            segs.append((seg_start, seg_end))
-
-    # 加上前後 padding
-    pad_samps = int(PAD_SEC * target_sr)
-    segs = [(max(0, s - pad_samps), min(len(audio_16k), e + pad_samps)) for s, e in segs]
-
-    # 合併相鄰/重疊的段
-    merged: List[Tuple[int, int]] = []
-    for s, e in sorted(segs):
-        if not merged or s > merged[-1][1]:
-            merged.append((s, e))
-        else:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-
-    return merged  # 以 16k 為座標
-
-def _map_16k_to_orig(segs_16k: List[Tuple[int, int]], orig_sr: int, target_sr: int = 16000) -> List[Tuple[int, int]]:
-    """把 16k 的 sample index 區間轉回原始取樣率的 index。"""
-    mapped = []
-    ratio = orig_sr / float(target_sr)
-    for s, e in segs_16k:
-        mapped.append((int(round(s * ratio)), int(round(e * ratio))))
-    return mapped
-
-def _split_long_segment(seg: Tuple[int, int], sr: int, max_sec: float, overlap_sec: float) -> List[Tuple[int, int]]:
-    """把太長的語音段切成小片段，含重疊。seg 是原始 sr 的 sample index 區間。"""
-    s, e = seg
-    max_samps = int(max_sec * sr)
-    ovl_samps = int(overlap_sec * sr)
+def _eos_ids(proc):
+    tok = proc.tokenizer
     out = []
-    cur = s
-    while cur < e:
-        end = min(cur + max_samps, e)
-        out.append((cur, end))
-        if end == e:
-            break
-        cur = max(end - ovl_samps, s)
-    return out
+    im_end = tok.convert_tokens_to_ids("<|im_end|>")
+    if im_end is not None: out.append(im_end)
+    if tok.eos_token_id is not None: out.append(tok.eos_token_id)
+    # 去重
+    return list(dict.fromkeys(out))
 
-def _write_wav_segment(audio: np.ndarray, sr: int, seg: Tuple[int, int]) -> str:
-    """把原始音訊的某段寫成暫存 WAV，回傳路徑。"""
-    s, e = seg
-    s = max(0, s); e = min(len(audio), e)
-    segment = audio[s:e]
-    fd, tmp_path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    sf.write(tmp_path, segment, sr)
-    return tmp_path
-
-def _qwen_transcribe_wav(wav_path: str, model, proc, max_new_tokens: int) -> str:
-    """
-    純 ASR：保留官方 system，不改；在 user 裡下嚴格指示 + 要求 JSON 輸出；
-    用 eos_token_id 讓生成在 <|im_end|> 即停，並用 stop_words_ids 擋常見噪聲前綴。
-    """
+def _transcribe_once(wav_path: str, proc, model, max_new_tokens: int) -> str:
+    # === vLLM 風格 prompt（官方 system + user: audio + 指令），讓 apply_chat_template 產生:
+    # <|im_start|>system ... <|im_end|>\n<|im_start|>user\n<AUDIO TOKENS> 指令<|im_end|>\n<|im_start|>assistant
+    default_system = ("You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+                      "capable of perceiving auditory and visual inputs, as well as generating text and speech.")
     conversations = [
-        {
-            "role": "system",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
-                }
-            ],
-        },
-        {
-            "role": "user",
-            "content": [
-                {"type": "audio", "path": wav_path},
-                {
-                    "type": "text",
-                    "text": (
-                        "ASR task: Transcribe the audio verbatim.\n"
-                        "Rules:\n"
-                        "1) Output ONLY the words actually spoken in the audio.\n"
-                        "2) No extra text, no explanations, no role tags (e.g., Human:, Assistant:, System:),\n"
-                        "   no prompts like 'continue writing'.\n"
-                        "3) If there is no speech, output exactly: [NO-SPEECH].\n"
-                        "4) Return a single-line JSON object: {\"text\": \"<TRANSCRIPT>\"} with no trailing text."
-                    )
-                },
-            ],
-        },
+        {"role": "system", "content": [{"type": "text", "text": default_system}]},
+        {"role": "user", "content": [
+            {"type": "audio", "path": wav_path},
+            {"type": "text", "text": "ASR task: transcribe the audio verbatim. Output only the words actually spoken. If no speech, output [NO-SPEECH]."}
+        ]},
     ]
 
     inputs = proc.apply_chat_template(
         conversations,
-        add_generation_prompt=True,   # 依模板要求，在最後補 <|im_start|>assistant\n
+        add_generation_prompt=True,   # 添加 <|im_start|>assistant
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
         padding=True
     ).to(model.device)
 
-    eos_ids, stop_words_ids = _special_ids(proc)
-
     out_ids = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
-        do_sample=False,                 # 穩定輸出
-        eos_token_id=eos_ids,           # **關鍵**：遇到 <|im_end|> 或 eos 即停
-        stop_words_ids=stop_words_ids,  # 擋掉常見噪聲開頭（可再擴充）
-        repetition_penalty=1.05
+        do_sample=False,                 # 不取樣，避免離題
+        eos_token_id=_eos_ids(proc)      # 靠 <|im_end|>/eos 結束
     )
 
-    # 只取新生成部分（避免把 prompt 一起解碼）
+    # 只解碼新增段
     gen_only = out_ids[:, inputs["input_ids"].shape[1]:]
-    text = proc.batch_decode(gen_only, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip()
+    text = proc.batch_decode(gen_only, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+    return text.strip()
 
-    # 只允許 JSON。一些模型可能仍夾雜前綴，這裡做穩健抽取。
-    # 簡單做法：抓第一個 {...} 區塊。
-    import re, json
-    m = re.search(r"\{.*\}", text, flags=re.S)
-    if m:
-        candidate = m.group(0)
-        try:
-            obj = json.loads(candidate)
-            out = obj.get("text", "").strip()
-            return out
-        except Exception:
-            pass
-
-    # fallback：把常見噪聲行清掉
-    noise_prefixes = ("Human:", "HUMAN:", "Human's question:", "User:", "Assistant:", "System:")
-    cleaned = []
-    for line in text.splitlines():
-        if any(line.strip().startswith(p) for p in noise_prefixes):
-            continue
-        cleaned.append(line)
-    cleaned_text = " ".join(" ".join(cleaned).split()).strip()
-    return cleaned_text
-
-def _normalize_ws(s: str) -> str:
-    return " ".join(s.split())
-
-def _merge_texts_with_overlap(pieces: List[str], min_overlap_chars: int = 10, max_probe: int = 80) -> str:
-    """
-    逐段合併，若前一段的尾端與下一段的開頭有重疊，去重合併。
-    - 探測重疊長度從 min_overlap_chars..max_probe 遞減尋找最長匹配。
-    - 簡單且實用，不引入 heavy NLP 對齊。
-    """
-    out = ""
-    for idx, cur in enumerate(pieces):
-        if idx == 0:
-            out = _normalize_ws(cur)
-            continue
-        prev = out
-        cur_n = _normalize_ws(cur)
-        best = 0
-        # 取 prev 的尾端與 cur 的開頭做匹配
-        for k in range(min(len(prev), max_probe), min_overlap_chars - 1, -1):
-            if prev[-k:] == cur_n[:k]:
-                best = k
-                break
-        if best > 0:
-            out = prev + cur_n[best:]
-        else:
-            # 沒有重疊，直接空格銜接
-            if prev and not prev.endswith(" "):
-                out = prev + " " + cur_n
-            else:
-                out = prev + cur_n
-    return out.strip()
-
-# -------------------- FastAPI 端點 --------------------
+# ===== API =====
 @app.post("/audio/transcribe")
-async def transcribe_audio(
-    file: UploadFile = File(...),
-    max_new_tokens: int = MAX_NEW_TOKENS,
-):
-    """
-    高品質 ASR：
-    1) webrtcvad 產生語音段（含合併、padding）
-    2) 對過長段再切片（帶重疊）
-    3) 逐片呼叫 Qwen Thinker 轉錄
-    4) 文字重疊去重合併
-    """
-    logger.info("開始轉錄音訊")
+async def transcribe_audio(file: UploadFile = File(...), max_new_tokens: int = 512):
     if not file:
         raise HTTPException(status_code=400, detail="No file provided")
-
     try:
-        _load_processor()
-        _load_thinker_model()
+        _load_proc()
+        _load_thinker()
 
-        raw = await file.read()
-        logger.info("收到音訊 bytes=%d", len(raw))
-        audio, sr = _bytes_to_audio(raw)
+        data = await file.read()
+        wav_path = _bytes_to_wav_path(data)
 
-        # === 1) VAD 產生語音段（先在 16k 上切，再映回原 sr）===
-        segs_16k = _vad_segments(audio, sr)
-        if not segs_16k:
-            logger.info("VAD 未偵測到語音，直接嘗試整檔切片轉錄")
-            # Fallback：整檔當一段
-            segs_orig = [(0, len(audio))]
-        else:
-            segs_orig = _map_16k_to_orig(segs_16k, sr)
+        transcript = _transcribe_once(wav_path, processor, thinker, max_new_tokens)
 
-        logger.info("VAD 段數：%d", len(segs_orig))
+        try: os.remove(wav_path)
+        except: pass
 
-        # === 2) 對每個 VAD 段長度過長時再切片（含重疊）===
-        final_segs: List[Tuple[int, int]] = []
-        for seg in segs_orig:
-            s, e = seg
-            dur = (e - s) / float(sr)
-            if dur > MAX_SEG_SEC:
-                parts = _split_long_segment(seg, sr, MAX_SEG_SEC, SEG_OVERLAP_SEC)
-                final_segs.extend(parts)
-            else:
-                final_segs.append(seg)
-
-        logger.info("切片後段數：%d", len(final_segs))
-
-        # === 3) 逐段轉錄 ===
-        texts: List[str] = []
-        tmp_paths: List[str] = []
-        try:
-            for i, seg in enumerate(final_segs, 1):
-                wav_path = _write_wav_segment(audio, sr, seg)
-                tmp_paths.append(wav_path)
-                seg_text = _qwen_transcribe_wav(wav_path, thinker_model, processor, max_new_tokens)
-                texts.append(seg_text)
-                logger.debug("段 %d 轉錄字數=%d", i, len(seg_text))
-        finally:
-            for p in tmp_paths:
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-
-        # === 4) 文字重疊智慧合併 ===
-        transcription = _merge_texts_with_overlap(texts)
-
-        _touch_last_used()
-        start_timeout_monitor()
-        return JSONResponse(content={"transcription": transcription})
-
+        _touch(); _start_monitor_once()
+        return JSONResponse(content={"transcription": transcript})
     except Exception as e:
-        logger.exception("ASR 流程發生錯誤")
+        logger.exception("ASR 發生錯誤")
         raise HTTPException(status_code=500, detail=f"Error processing audio file: {e}") from e
 
 @app.get("/health")
