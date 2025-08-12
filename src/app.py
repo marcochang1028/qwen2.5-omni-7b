@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from transformers import (
     Qwen2_5OmniProcessor,
     Qwen2_5OmniThinkerForConditionalGeneration,
+    StoppingCriteria, StoppingCriteriaList,
 )
 
 # ===============================
@@ -27,11 +28,30 @@ from transformers import (
 # - VAD 語音端點偵測：webrtcvad（16k/mono/16-bit PCM）
 # - 長段落安全切片：max_seg_sec + seg_overlap_sec
 # - 文字智慧合併：段與段的重疊去重（suffix/prefix 比對）
-# - 生成：thinker_do_sample=False / thinker_temperature=0.0（穩定）
+# - 生成：thinker_do_sample=False（穩定）
 # - 空閒釋放：GPU/記憶體清理
 # ===============================
 
 load_dotenv()
+
+# 停止條件類別：避免輸出對話標籤和續寫提示
+class StopOnStrings(StoppingCriteria):
+    def __init__(self, tokenizer, stop_strings):
+        self.tokenizer = tokenizer
+        self.stop_strings = stop_strings
+        self.generated = ""
+
+    def __call__(self, input_ids, scores, **kwargs):
+        # 只解碼新增部分，避免每步全量解碼
+        new_text = self.tokenizer.decode(input_ids[0][-1:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        self.generated += new_text
+        for s in self.stop_strings:
+            if self.generated.endswith(s):
+                return True
+        return False
+
+# 設定 Transformers 詳細程度以避免警告
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 log_format = os.getenv("LOG_FORMAT", "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -260,48 +280,65 @@ def _write_wav_segment(audio: np.ndarray, sr: int, seg: Tuple[int, int]) -> str:
     return tmp_path
 
 def _qwen_transcribe_wav(wav_path: str, model, proc, max_new_tokens: int) -> str:
-    """呼叫 Qwen Thinker 對單一 WAV 轉錄（純 ASR 模式）"""
+    """
+    單段轉錄（保留官方 system prompt；user 內加嚴格 ASR 指示；加入停止準則）
+    """
     conversations = [
         {
             "role": "system",
             "content": [
-                {"type": "text", "text": "You are a speech-to-text model. Output only the exact transcription of the audio without any additional comments or dialogue."}
+                {
+                    "type": "text",
+                    "text": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
+                }
             ],
         },
         {
             "role": "user",
             "content": [
-                {"type": "audio", "path": wav_path}
+                {"type": "audio", "path": wav_path},
+                {
+                    "type": "text",
+                    "text": (
+                        "ASR task: Transcribe the audio verbatim. "
+                        "Output ONLY the words actually spoken in the audio. "
+                        "Do NOT include any extra text, explanations, labels, or role tags such as 'Human:', 'HUMAN:', "
+                        "'User:', 'Assistant:', 'System:'. "
+                        "Do NOT invent, continue, or request to 'continue writing'. "
+                        "If there is non-speech or silence only, return [NO-SPEECH]."
+                    )
+                },
             ],
         },
     ]
 
     inputs = proc.apply_chat_template(
         conversations,
-        add_generation_prompt=True,
+        add_generation_prompt=True,   # 依官方範例維持 True
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
         padding=True
     ).to(model.device)
 
-    # 根據模型類型自動選擇參數
-    if isinstance(model, Qwen2_5OmniThinkerForConditionalGeneration):
-        # Thinker-only 模型：使用標準參數
-        out_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=0.0,
-        )
-    else:
-        # 全 Omni 模型：使用 thinker_* 參數
-        out_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            thinker_do_sample=False,
-            thinker_temperature=0.0,
-        )
+    # 停止條件：一旦模型開始產生對話式標籤或續寫提示，就立刻停
+    stop_strings = [
+        "\nHuman:", "Human:", "\nHUMAN", "HUMAN:",
+        "\nUser:", "User:",
+        "\nAssistant:", "Assistant:", "ASSISTANT:",
+        "\nSystem:", "System:",
+        "请续写下面这段话", "請續寫下面這段話", "請繼續", "继续", "續寫"
+    ]
+    stopping_criteria = StoppingCriteriaList([StopOnStrings(proc.tokenizer, stop_strings)])
+
+    out_ids = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,             # 穩定、可重現
+        temperature=0.0,
+        repetition_penalty=1.05,     # 抑制重複段落（可視需要調整/移除）
+        stopping_criteria=stopping_criteria
+    )
 
     text = proc.batch_decode(out_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
     return text.strip()
