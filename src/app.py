@@ -23,15 +23,11 @@ from transformers import (
 )
 
 # ===============================
-# Qwen2.5-Omni ASR 強化版（保持你現在的生成邏輯與效果）
-# - 固定 HF revision（可重現）
-# - FA2（不支援則自動回退，不影響輸出）
-# - inference_mode + AMP（greedy 下不影響輸出）
-# - 段內/段後心跳，避免 idle 被回收
-# - OOM/長段安全回退（降 max_new_tokens 一次）
-# - tokenizer 左側 padding、pad_token=eos
-# - HF cache 環境一致
-# - 音訊增益/VAD/切片/重疊合併 = 與你先前版一致
+# Qwen2.5-Omni ASR（與 Phi-4 相同的啟用/卸載監控）
+# - active_requests + heartbeat，避免長生成時被 idle 釋放
+# - idle monitor 超時釋放（GPU/CPU）
+# - startup 預熱（可失敗不致命）
+# - 其他生成/切片/合併邏輯保持你原樣
 # ===============================
 
 load_dotenv()
@@ -76,18 +72,35 @@ IDLE_TIMEOUT    = int(os.getenv("IDLE_TIMEOUT", "300"))
 app = FastAPI()
 processor: Qwen2_5OmniProcessor | None = None
 thinker: Qwen2_5OmniThinkerForConditionalGeneration | None = None
+
+# ===== 與 Phi-4 一致的全域監控狀態 =====
 last_used_time = None
 timeout_thread = None
+active_requests = 0
+active_lock = threading.Lock()
 
 # ========= 基礎工具 =========
 def _touch():
     global last_used_time
     last_used_time = time.time()
 
+def _heartbeat_loop():
+    # 單純每 5 秒觸發一次存活心跳，避免長生成時被 idle 回收
+    while True:
+        time.sleep(5)
+        _touch()
+
+def _heartbeat_start():
+    t = threading.Thread(target=_heartbeat_loop, daemon=True)
+    t.start()
+
 def _idle_monitor():
     global processor, thinker, last_used_time
     while True:
         time.sleep(10)
+        # 只要有活躍請求，就不釋放
+        if active_requests > 0:
+            continue
         if last_used_time and (time.time() - last_used_time > IDLE_TIMEOUT):
             logger.info("閒置釋放資源...")
             try:
@@ -110,13 +123,13 @@ def _start_monitor_once():
         timeout_thread.start()
 
 def _gen_ctx():
-    # AMP：在 greedy 下不影響輸出結果（只提速省顯存）
+    # AMP：greedy 下不影響輸出結果（只提速省顯存）
     if torch.cuda.is_available():
         return torch.cuda.amp.autocast(dtype=torch.float16)
     return nullcontext()
 
 def _safe_generate(generate_fn, max_new_tokens, timeout_s=60):
-    """OOM/長段超時的保護；若 OOM 則清 cache 並把 max_new_tokens 對半重試一次。"""
+    """OOM/長段超時保護；OOM 清 cache 並把 max_new_tokens 對半重試一次。"""
     try:
         t0 = time.time()
         out = generate_fn(max_new_tokens)
@@ -138,7 +151,7 @@ def _load_proc():
             MODEL_NAME, token=HF_TOKEN, revision=HF_REVISION
         )
         logger.info("Processor 載入完成")
-        # tokenizer 小設定（不改文本內容）
+        # tokenizer 設定（不改語意）
         if processor.tokenizer is not None:
             processor.tokenizer.padding_side = "left"
             if processor.tokenizer.pad_token_id is None and processor.tokenizer.eos_token is not None:
@@ -154,7 +167,7 @@ def _load_thinker():
             revision=HF_REVISION,
             torch_dtype="auto",
             device_map="auto",
-            attn_implementation="flash_attention_2",  # 不支援會自動回退
+            attn_implementation="sdpa",  # 預設 SDPA；無需 FA2 也可正常推論
         )
         logger.info("Thinker 模型載入完成")
         # 消警告：pad_token_id
@@ -391,6 +404,19 @@ def _transcribe_once(wav_path: str, proc: Qwen2_5OmniProcessor, model, max_new_t
         text = text[len("transcript:"):].lstrip()
     return text
 
+# ========= Startup 預熱（與 Phi-4 一致） =========
+@app.on_event("startup")
+async def _startup():
+    try:
+        _load_proc()
+        _load_thinker()
+        _touch()
+        _start_monitor_once()
+        _heartbeat_start()
+        logger.info("warmup done")
+    except Exception as e:
+        logger.warning(f"warmup failed: {e}")
+
 # ========= API =========
 @app.post("/audio/transcribe")
 async def transcribe_audio(
@@ -406,15 +432,19 @@ async def transcribe_audio(
       5) 逐段推論；重疊文字去重合併
       6) 若 VAD 無段，fallback：整檔切片/或直接推論
     """
+    # 與 Phi-4 一致：入口計數 + 心跳
+    global active_requests
+    with active_lock:
+        active_requests += 1
     _touch()
-    _start_monitor_once()
-
-    if not file:
-        raise HTTPException(status_code=400, detail="No file provided")
 
     try:
+        if not file:
+            raise HTTPException(status_code=400, detail="No file provided")
+
         _load_proc()
         _load_thinker()
+        _start_monitor_once()  # 保險：若 startup 失敗也能啟動監控
 
         raw = await file.read()
         y, sr = _bytes_to_audio_mono(raw)
@@ -476,6 +506,10 @@ async def transcribe_audio(
     except Exception as e:
         logger.exception("ASR 流程錯誤")
         raise HTTPException(status_code=500, detail=f"Error processing audio file: {e}") from e
+    finally:
+        # 與 Phi-4 一致：出口計數
+        with active_lock:
+            active_requests -= 1
 
 @app.get("/health")
 async def health():
