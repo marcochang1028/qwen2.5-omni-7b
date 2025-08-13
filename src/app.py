@@ -58,6 +58,9 @@ MIN_SPEECH_SEC  = float(os.getenv("ASR_MIN_SPEECH_SEC", "0.3"))
 MAX_SILENCE_SEC = float(os.getenv("ASR_MAX_SILENCE_SEC", "0.5"))
 PAD_SEC         = float(os.getenv("ASR_PAD_SEC", "0.2"))
 
+# 靜音檢測參數
+SILENCE_DB_THRESHOLD = float(os.getenv("ASR_SILENCE_DB_THRESHOLD", "-50.0"))
+
 # 切片參數
 CHUNK_SEC       = float(os.getenv("ASR_CHUNK_SEC", "30.0"))
 MAX_SEG_SEC     = float(os.getenv("ASR_MAX_SEG_SEC", "45.0"))
@@ -83,6 +86,23 @@ active_lock = threading.Lock()
 def _touch():
     global last_used_time
     last_used_time = time.time()
+
+def _should_skip_silence(audio_array: np.ndarray, sr: int, db_threshold: float = None) -> bool:
+    """檢查段落是否為靜音（低於門檻則略過）"""
+    if audio_array.size == 0:
+        return True
+    
+    # 使用環境變數的門檻值，如果沒有傳入參數
+    if db_threshold is None:
+        db_threshold = SILENCE_DB_THRESHOLD
+    
+    # 使用 RMS 能量快速檢測
+    rms = np.sqrt(np.mean(audio_array**2))
+    if rms == 0:
+        return True
+    
+    rms_db = 20 * np.log10(rms)
+    return rms_db < db_threshold
 
 def _heartbeat_loop():
     # 單純每 5 秒觸發一次存活心跳，避免長生成時被 idle 回收
@@ -203,6 +223,12 @@ def _bytes_to_audio_mono(data: bytes) -> Tuple[np.ndarray, int]:
     return y, sr
 
 def _preprocess_audio_for_model(y: np.ndarray, sr: int) -> Tuple[np.ndarray, int]:
+    """
+    音訊前處理：裁切靜音、自動增益控制
+    注意：保持原始取樣率，不強制重取樣到16kHz
+    原因：Qwen2.5的processor本身會處理重取樣，保持原樣是安全的
+    若想與Phi4更一致，可在寫檔前先重取樣到16kHz（通常差異不大，但在極端採樣率/高噪環境有時能更穩）
+    """
     if y.size == 0:
         return y, sr
     z = y.copy()
@@ -217,6 +243,12 @@ def _preprocess_audio_for_model(y: np.ndarray, sr: int) -> Tuple[np.ndarray, int
     return z, sr
 
 def _write_wav(y: np.ndarray, sr: int) -> str:
+    """
+    將音訊寫入PCM16 WAV檔案
+    注意：保持原始取樣率，不強制重取樣到16kHz
+    原因：Qwen2.5的processor本身會處理重取樣，保持原樣是安全的
+    若想與Phi4更一致，可在寫檔前先重取樣到16kHz（通常差異不大，但在極端採樣率/高噪環境有時能更穩）
+    """
     fd, path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
     sf.write(path, y, sr, subtype="PCM_16")
@@ -485,6 +517,12 @@ async def transcribe_audio(
                 _touch()  # 段前心跳
                 ss = max(0, s); ee = min(len(y_model), e)
                 seg = y_model[ss:ee]
+                
+                # 靜音快篩：跳過靜音段落
+                if _should_skip_silence(seg, sr_model):
+                    logger.debug(f"略過靜音段落 idx={i}")
+                    continue
+                
                 seg_path = _write_wav(seg, sr_model)
                 tmp_paths.append(seg_path)
 
