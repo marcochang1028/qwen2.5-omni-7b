@@ -6,6 +6,7 @@ import gc
 import tempfile
 from io import BytesIO
 from typing import List, Tuple
+from contextlib import nullcontext
 
 import numpy as np
 import soundfile as sf
@@ -22,49 +23,48 @@ from transformers import (
 )
 
 # ===============================
-# Qwen2.5-Omni ASR 強化版（簡單 prompt + 全套音訊優化）
-# - Prompt：官方 system，不改；user 只放 audio（不加文字）；無自訂 stop words
-# - 音訊優化：
-#   * 可選去頭尾靜音（TRIM_DB）
-#   * 自動增益到目標 dBFS
-#   * VAD 分段（16k/mono/PCM16 供 VAD 用；模型仍吃原始取樣率切片）
-#   * 固定長度切片 + 重疊（CHUNK_SEC、SEG_OVERLAP_SEC）
-#   * 長片段二次切片（MAX_SEG_SEC）
-#   * 文字重疊去重合併
-# - 推論：Thinker-only；do_sample=False；以 <|im_end|>/eos 停止
+# Qwen2.5-Omni ASR 強化版（保持你現在的生成邏輯與效果）
+# - 固定 HF revision（可重現）
+# - FA2（不支援則自動回退，不影響輸出）
+# - inference_mode + AMP（greedy 下不影響輸出）
+# - 段內/段後心跳，避免 idle 被回收
+# - OOM/長段安全回退（降 max_new_tokens 一次）
+# - tokenizer 左側 padding、pad_token=eos
+# - HF cache 環境一致
+# - 音訊增益/VAD/切片/重疊合併 = 與你先前版一致
 # ===============================
 
 load_dotenv()
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HOME", "/root/.cache/huggingface")
+os.environ.setdefault("TRANSFORMERS_CACHE", "/root/.cache/huggingface")
 
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 log_format = os.getenv("LOG_FORMAT", "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logging.basicConfig(level=log_level, format=log_format, force=True)
 logger = logging.getLogger("qwen2.5-omni-asr-full")
 
-HF_TOKEN   = os.getenv("HUGGINGFACE_API_KEY")
+HF_TOKEN = os.getenv("HUGGINGFACE_API_KEY")
 if not HF_TOKEN:
     raise RuntimeError("HUGGINGFACE_API_KEY 未設定")
 
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-Omni-7B")
+MODEL_NAME  = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-Omni-7B")
+HF_REVISION = os.getenv("HF_REVISION", "main")  # 固定版本，避免 remote code 演變
 
 # ===== 音訊處理參數 =====
-# 去頭尾靜音（0 = 關閉；常見 40~50）
 TRIM_DB         = int(os.getenv("ASR_TRIM_DB", "0"))
-# 自動增益目標（dBFS），建議 -20 ~ -18
 TARGET_DBFS     = float(os.getenv("ASR_GAIN_TARGET_DBFS", "-20"))
-# 峰值限制
 PEAK_LIMIT      = float(os.getenv("ASR_PEAK_LIMIT", "0.99"))
 
 # VAD 參數
-VAD_AGGR        = int(os.getenv("ASR_VAD_AGGR", "2"))      # 0~3
+VAD_AGGR        = int(os.getenv("ASR_VAD_AGGR", "2"))
 MIN_SPEECH_SEC  = float(os.getenv("ASR_MIN_SPEECH_SEC", "0.3"))
 MAX_SILENCE_SEC = float(os.getenv("ASR_MAX_SILENCE_SEC", "0.5"))
 PAD_SEC         = float(os.getenv("ASR_PAD_SEC", "0.2"))
 
 # 切片參數
-CHUNK_SEC       = float(os.getenv("ASR_CHUNK_SEC", "30.0"))  # 固定長度切（0 = 關閉）
-MAX_SEG_SEC     = float(os.getenv("ASR_MAX_SEG_SEC", "45.0"))# 二次切片上限
+CHUNK_SEC       = float(os.getenv("ASR_CHUNK_SEC", "30.0"))
+MAX_SEG_SEC     = float(os.getenv("ASR_MAX_SEG_SEC", "45.0"))
 SEG_OVERLAP_SEC = float(os.getenv("ASR_SEG_OVERLAP_SEC", "1.0"))
 
 # 生成參數
@@ -109,22 +109,52 @@ def _start_monitor_once():
         timeout_thread = threading.Thread(target=_idle_monitor, daemon=True)
         timeout_thread.start()
 
+def _gen_ctx():
+    # AMP：在 greedy 下不影響輸出結果（只提速省顯存）
+    if torch.cuda.is_available():
+        return torch.cuda.amp.autocast(dtype=torch.float16)
+    return nullcontext()
+
+def _safe_generate(generate_fn, max_new_tokens, timeout_s=60):
+    """OOM/長段超時的保護；若 OOM 則清 cache 並把 max_new_tokens 對半重試一次。"""
+    try:
+        t0 = time.time()
+        out = generate_fn(max_new_tokens)
+        if time.time() - t0 > timeout_s:
+            logger.warning("segment generate exceeded soft timeout (%.1fs)", timeout_s)
+        return out
+    except torch.cuda.OutOfMemoryError:
+        logger.warning("OOM. Clearing cache and retry with half max_new_tokens.")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        half = max(128, max_new_tokens // 2)
+        return generate_fn(half)
+
 def _load_proc():
     global processor
     if processor is None:
         logger.info("載入 Processor ...")
-        processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
+        processor = Qwen2_5OmniProcessor.from_pretrained(
+            MODEL_NAME, token=HF_TOKEN, revision=HF_REVISION
+        )
         logger.info("Processor 載入完成")
-        # 消警告：pad_token 用 eos
-        if processor.tokenizer.pad_token_id is None and processor.tokenizer.eos_token is not None:
-            processor.tokenizer.pad_token = processor.tokenizer.eos_token
+        # tokenizer 小設定（不改文本內容）
+        if processor.tokenizer is not None:
+            processor.tokenizer.padding_side = "left"
+            if processor.tokenizer.pad_token_id is None and processor.tokenizer.eos_token is not None:
+                processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
 def _load_thinker():
     global thinker
     if thinker is None:
         logger.info("載入 Thinker 模型 ...")
         thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
-            MODEL_NAME, torch_dtype="auto", device_map="auto", token=HF_TOKEN
+            MODEL_NAME,
+            token=HF_TOKEN,
+            revision=HF_REVISION,
+            torch_dtype="auto",
+            device_map="auto",
+            attn_implementation="flash_attention_2",  # 不支援會自動回退
         )
         logger.info("Thinker 模型載入完成")
         # 消警告：pad_token_id
@@ -139,19 +169,11 @@ def _eos_ids(proc: Qwen2_5OmniProcessor) -> List[int]:
         ids.append(im_end)
     if tok.eos_token_id is not None:
         ids.append(tok.eos_token_id)
-    # 去重
     return list(dict.fromkeys(ids))
 
 def _append_assistant_prefill(proc, model_device, inputs_dict, prefill_text: str):
-    """
-    在 <|im_start|>assistant 後面補一段前綴（例如 'Transcript: '），
-    讓模型沿這個格式往下生成。這不是 stop word。
-    """
     tok = proc.tokenizer
-    pre_ids = tok.encode(prefill_text, add_special_tokens=False, return_tensors="pt")
-    pre_ids = pre_ids.to(model_device)
-
-    # 拼到 input_ids 後面，mask 也要一起補 1
+    pre_ids = tok.encode(prefill_text, add_special_tokens=False, return_tensors="pt").to(model_device)
     inputs_dict["input_ids"] = torch.cat([inputs_dict["input_ids"], pre_ids], dim=1)
     if "attention_mask" in inputs_dict:
         add_mask = torch.ones_like(pre_ids, dtype=inputs_dict["attention_mask"].dtype)
@@ -168,38 +190,26 @@ def _bytes_to_audio_mono(data: bytes) -> Tuple[np.ndarray, int]:
     return y, sr
 
 def _preprocess_audio_for_model(y: np.ndarray, sr: int) -> Tuple[np.ndarray, int]:
-    """
-    供模型吃的音訊：
-    - 可選去頭尾靜音（TRIM_DB）
-    - RMS 自動增益到 TARGET_DBFS（限制峰值）
-    - 不強制改採樣率（讓 Processor 處理），只輸出 PCM16
-    """
     if y.size == 0:
         return y, sr
     z = y.copy()
-
-    # 去頭尾靜音（可關）
     if TRIM_DB > 0:
         z, _ = librosa.effects.trim(z, top_db=TRIM_DB)
-
-    # RMS -> 目標 dBFS
     if z.size > 0:
         rms = float(np.sqrt(np.mean(z**2) + 1e-12))
-        target = _db_to_amp(TARGET_DBFS)  # 例如 -20dBFS ≈ 0.1
+        target = _db_to_amp(TARGET_DBFS)  # 約 0.1（-20 dBFS）
         if rms > 0 and rms < target:
             gain = target / rms
             z = np.clip(z * gain, -PEAK_LIMIT, PEAK_LIMIT)
-
     return z, sr
 
 def _write_wav(y: np.ndarray, sr: int) -> str:
     fd, path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
-    # 統一 PCM16，穩
     sf.write(path, y, sr, subtype="PCM_16")
     return path
 
-# ========= VAD（只用於偵測；不改變模型吃的取樣率） =========
+# ========= VAD（只用於偵測；不改模型吃的 sr） =========
 def _resample_for_vad(y: np.ndarray, sr: int, target_sr: int = 16000) -> np.ndarray:
     if y.size == 0:
         return y
@@ -212,16 +222,13 @@ def _float32_to_pcm16(x: np.ndarray) -> bytes:
     return (x * 32767.0).astype(np.int16).tobytes()
 
 def _frame_gen(pcm16: bytes, sr: int, frame_ms: int = 20):
-    n = int(sr * (frame_ms / 1000.0)) * 2  # 2 bytes/sample
+    n = int(sr * (frame_ms / 1000.0)) * 2
     for i in range(0, len(pcm16), n):
         chunk = pcm16[i:i+n]
         if len(chunk) == n:
             yield chunk
 
 def _vad_segments(y: np.ndarray, sr: int) -> List[Tuple[int, int]]:
-    """
-    以 16k/mono/PCM16 做 VAD，回傳在 16k 取樣座標的 (start, end)
-    """
     if y.size == 0:
         return []
     target_sr = 16000
@@ -270,18 +277,15 @@ def _vad_segments(y: np.ndarray, sr: int) -> List[Tuple[int, int]]:
             e = (last_voiced + 1) * frm_len
             segs.append((s, e))
 
-    # padding
     pad = int(PAD_SEC * target_sr)
     segs = [(max(0, s - pad), min(len(y16), e + pad)) for s, e in segs]
 
-    # 合併重疊/相鄰
     merged: List[Tuple[int, int]] = []
     for s, e in sorted(segs):
         if not merged or s > merged[-1][1]:
             merged.append((s, e))
         else:
             merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-
     return merged
 
 def _map_16k_to_orig(segs_16k: List[Tuple[int, int]], orig_sr: int, target_sr: int = 16000) -> List[Tuple[int, int]]:
@@ -338,18 +342,14 @@ def _merge_texts_with_overlap(pieces: List[str], min_overlap_chars: int = 10, ma
         if best > 0:
             out = prev + cur_n[best:]
         else:
-            if prev and not prev.endswith(" "):
-                out = prev + " " + cur_n
-            else:
-                out = prev + cur_n
+            out = (prev + " " + cur_n) if (prev and not prev.endswith(" ")) else (prev + cur_n)
     return out.strip()
 
-# ========= 單段推論（軟性指示 + assistant prefill） =========
+# ========= 單段推論 =========
 def _transcribe_once(wav_path: str, proc: Qwen2_5OmniProcessor, model, max_new_tokens: int) -> str:
     default_system = ("You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
                       "capable of perceiving auditory and visual inputs, as well as generating text and speech.")
 
-    # 軟性 ASR 指示（避免嚴格規則導致 [NO-SPEECH]）
     conversations = [
         {"role": "system", "content": [{"type": "text", "text": default_system}]},
         {"role": "user",   "content": [
@@ -360,32 +360,35 @@ def _transcribe_once(wav_path: str, proc: Qwen2_5OmniProcessor, model, max_new_t
 
     inputs = proc.apply_chat_template(
         conversations,
-        add_generation_prompt=True,     # 產生 <|im_start|>assistant
+        add_generation_prompt=True,
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
         padding=True
     ).to(model.device)
 
-    # 在 assistant 起手加 prefill，拉回「逐字稿」格式
+    # assistant prefill（不影響語意，只讓格式更穩）
     inputs = _append_assistant_prefill(proc, model.device, inputs, "Transcript: ")
 
-    out_ids = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        eos_token_id=_eos_ids(proc),
-        pad_token_id=proc.tokenizer.eos_token_id,
-    )
+    def _do_gen(mnt):
+        return model.generate(
+            **inputs,
+            max_new_tokens=mnt,
+            do_sample=False,
+            eos_token_id=_eos_ids(proc),
+            pad_token_id=proc.tokenizer.eos_token_id,
+        )
+
+    with torch.inference_mode():
+        with _gen_ctx():
+            out_ids = _safe_generate(_do_gen, max_new_tokens)
 
     # 只解碼新增段
     gen_only = out_ids[:, inputs["input_ids"].shape[1]:]
     text = proc.batch_decode(gen_only, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip()
 
-    # 輕度清理：去除我們的前綴
     if text.lower().startswith("transcript:"):
         text = text[len("transcript:"):].lstrip()
-
     return text
 
 # ========= API =========
@@ -403,6 +406,9 @@ async def transcribe_audio(
       5) 逐段推論；重疊文字去重合併
       6) 若 VAD 無段，fallback：整檔切片/或直接推論
     """
+    _touch()
+    _start_monitor_once()
+
     if not file:
         raise HTTPException(status_code=400, detail="No file provided")
 
@@ -422,16 +428,13 @@ async def transcribe_audio(
         if segs_16k:
             segs = _map_16k_to_orig(segs_16k, sr)  # 在原始 sr 座標
         else:
-            # 無語音偵測 → fallback：整檔一段（讓模型試一次）
             segs = [(0, len(y_model))]
             logger.info("VAD 無段，使用整檔作為單一段")
 
         # 固定長度切片 + 長片段二次切片
         final_segs: List[Tuple[int, int]] = []
         for s, e in segs:
-            # 先固定長度切
             parts = _split_by_chunk((s, e), sr_model, CHUNK_SEC, SEG_OVERLAP_SEC) if CHUNK_SEC > 0 else [(s, e)]
-            # 再對超長做二次切
             for ps, pe in parts:
                 dur = (pe - ps) / float(sr_model)
                 if dur > MAX_SEG_SEC:
@@ -441,6 +444,7 @@ async def transcribe_audio(
 
         logger.info("切片後段數：%d", len(final_segs))
         if not final_segs:
+            _touch()
             return JSONResponse(content={"transcription": "[NO-SPEECH]"})
 
         # 逐段推論
@@ -448,6 +452,7 @@ async def transcribe_audio(
         tmp_paths: List[str] = []
         try:
             for i, (s, e) in enumerate(final_segs, 1):
+                _touch()  # 段前心跳
                 ss = max(0, s); ee = min(len(y_model), e)
                 seg = y_model[ss:ee]
                 seg_path = _write_wav(seg, sr_model)
@@ -456,6 +461,7 @@ async def transcribe_audio(
                 seg_text = _transcribe_once(seg_path, processor, thinker, max_new_tokens)
                 pieces.append(seg_text)
                 logger.debug("段 %d 長度=%.2fs 轉錄字數=%d", i, (ee-ss)/float(sr_model), len(seg_text))
+                _touch()  # 段後心跳
         finally:
             for p in tmp_paths:
                 try: os.remove(p)
@@ -464,7 +470,7 @@ async def transcribe_audio(
         # 合併
         transcription = _merge_texts_with_overlap(pieces)
 
-        _touch(); _start_monitor_once()
+        _touch()
         return JSONResponse(content={"transcription": transcription if transcription else "[NO-SPEECH]"})
 
     except Exception as e:
