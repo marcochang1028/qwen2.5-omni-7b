@@ -35,7 +35,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     CUDA_DEVICE_MAX_CONNECTIONS=1 \
     HF_HOME=/root/.cache/huggingface \
-    TRANSFORMERS_CACHE=/root/.cache/huggingface \
     PYTHONPATH=/app
 
 # 先安裝依賴（用快取；requirements 變動才會重裝）
