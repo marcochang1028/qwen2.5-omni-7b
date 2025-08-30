@@ -57,7 +57,7 @@ TRIM_DB         = int(os.getenv("ASR_TRIM_DB", "0"))
 TARGET_DBFS     = float(os.getenv("ASR_GAIN_TARGET_DBFS", "-20"))
 PEAK_LIMIT      = float(os.getenv("ASR_PEAK_LIMIT", "0.99"))
 
-# VAD：預設值（實際會由 _pick_vad_aggr 動態調整）
+# VAD：預設值（實際由 _pick_vad_aggr 動態調整）
 VAD_AGGR        = int(os.getenv("ASR_VAD_AGGR", "2"))
 MIN_SPEECH_SEC  = float(os.getenv("ASR_MIN_SPEECH_SEC", "0.3"))
 MAX_SILENCE_SEC = float(os.getenv("ASR_MAX_SILENCE_SEC", "0.5"))
@@ -282,7 +282,7 @@ def _write_wav(y: np.ndarray, sr: int) -> str:
     if sr != 16000:
         y = librosa.resample(y, orig_sr=sr, target_sr=16000, res_type="polyphase")
         sr = 16000
-    if y.ndim > 1:
+    if hasattr(y, "ndim") and y.ndim > 1:
         y = y.mean(axis=1)
     if y.size > 0:
         y = np.clip(y, -1.0, 1.0)
@@ -475,8 +475,9 @@ def _cap_tokens_by_duration(sec: float, hard_cap: int) -> int:
 
 # ========= Qwen 生成工具 =========
 def _gen_ctx():
+    # 修正 deprecated：改用 torch.amp.autocast("cuda", ...)
     if torch.cuda.is_available():
-        return torch.cuda.amp.autocast(dtype=torch.float16)
+        return torch.amp.autocast("cuda", dtype=torch.float16)
     return nullcontext()
 
 def _safe_generate(generate_fn, max_new_tokens, max_time_s: Optional[float] = None, timeout_s: float = 60):
@@ -535,7 +536,7 @@ def _transcribe_once(
     max_new_tokens: int,
     max_time: Optional[float],
 ) -> str:
-    # 保持官方預設 system 語句（不加 zh-TW/code-switching 指示）
+    # 官方預設 system（不加 zh-TW 或 code-switching 指示）
     default_system = ("You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
                       "capable of perceiving auditory and visual inputs, as well as generating text and speech.")
 
@@ -601,7 +602,7 @@ def _do_transcribe(temp_path: str,
     aggr = _pick_vad_aggr(y_model, sr_model, fallback=VAD_AGGR)
     logger.info(f"VAD aggressiveness picked: {aggr}")
 
-    # VAD 在 16k 偵測 -> 座標映回原 sr（與 phi4 一致）
+    # VAD 在 16k 偵測 -> 座標映回原 sr
     segs_16k = _vad_segments(y_model, sr_model, aggr=aggr)
     if segs_16k:
         segs = _map_16k_to_orig(segs_16k, sr_model)
@@ -652,8 +653,10 @@ def _do_transcribe(temp_path: str,
             _touch()  # 長段保活
     finally:
         for p in tmp_paths:
-            try: os.remove(p)
-            except: pass
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
     transcription = _merge_texts_with_overlap(pieces)
     _touch()
@@ -795,4 +798,5 @@ async def transcribe_audio(file: UploadFile = File(...),
 
 if __name__ == "__main__":
     import uvicorn
+    # 保留 lazy-load（不在 startup 強制 load_model）
     uvicorn.run(app, host="0.0.0.0", port=8000)
