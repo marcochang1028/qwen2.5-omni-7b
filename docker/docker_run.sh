@@ -12,12 +12,12 @@ set +a
 mkdir -p "$PWD/models"
 
 # 3) 起容器（仍保留 --env-file 給容器環境）
-docker rm -f qwen2.5-asr 2>/dev/null || true
-docker run -d --name qwen2.5-asr \
+docker rm -f qwen25-asr 2>/dev/null || true
+docker run -d --name qwen25-asr \
   --gpus all \
   --ipc=host \
   --network pgi_llm_network \
-  --network-alias qwen2.5-asr \
+  --network-alias qwen25-asr \
   --env-file ./config/.env \
   -e HF_HOME=/models \
   -e HUGGINGFACE_HUB_CACHE=/models/hub \
