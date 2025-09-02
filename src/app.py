@@ -214,7 +214,7 @@ def load_model():
                     revision=HF_REVISION,
                     token=HF_TOKEN,
                     trust_remote_code=True,
-                    torch_dtype=(torch.float16 if torch.cuda.is_available() else torch.float32),
+                    torch_dtype="auto",
                     device_map=None,                # 關掉分片
                     low_cpu_mem_usage=False,        # 避免殘留 meta 權重
                     attn_implementation="sdpa",
