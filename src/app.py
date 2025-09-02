@@ -182,11 +182,11 @@ def start_timeout_monitor():
         logger.info("監控執行緒已啟動")
 
 
-# ========= 模型載入（Lazy + 雙重鎖，與 Phi-4 一致）=========
+# ========= 模型載入（Lazy + 單卡上機）=========
 def load_model():
     """
     Lazy load Qwen2.5-Omni：
-    - 保留原載入設定（token、revision、torch_dtype、device_map、attn_implementation）
+    - 明確停用 device_map="auto"，整個模型放到單一裝置（GPU/CPU）
     - 一次性 GPU 優化（TF32 / cudnn / eval / requires_grad=False）
     """
     global processor, thinker
@@ -195,7 +195,7 @@ def load_model():
         with model_lock:
             if processor is None:
                 logger.info("載入 Processor ...")
-                common_kwargs = {"revision": HF_REVISION, "token": HF_TOKEN}
+                common_kwargs = {"revision": HF_REVISION, "token": HF_TOKEN, "trust_remote_code": True}
                 if HF_CACHE_DIR:
                     common_kwargs["cache_dir"] = HF_CACHE_DIR
                 processor_local = _safe_from_pretrained(
@@ -210,17 +210,23 @@ def load_model():
 
             if thinker is None:
                 logger.info("載入 Thinker 模型 ...")
-                model_kwargs = dict(revision=HF_REVISION, token=HF_TOKEN, torch_dtype="auto",
-                                    device_map="auto", attn_implementation="sdpa")
+                model_kwargs = dict(
+                    revision=HF_REVISION,
+                    token=HF_TOKEN,
+                    trust_remote_code=True,
+                    torch_dtype=(torch.float16 if torch.cuda.is_available() else torch.float32),
+                    device_map=None,                # 關掉分片
+                    low_cpu_mem_usage=False,        # 避免殘留 meta 權重
+                    attn_implementation="sdpa",
+                )
                 if HF_CACHE_DIR:
                     model_kwargs["cache_dir"] = HF_CACHE_DIR
                 thinker_local = _safe_from_pretrained(
                     Qwen2_5OmniThinkerForConditionalGeneration, MODEL_NAME, **model_kwargs
                 )
-                try:
-                    thinker_local.to(DEVICE)
-                except Exception:
-                    logger.debug("model.to(device) 失敗（可能已由 device_map=auto 分配），忽略。")
+
+                # 明確上到目標裝置
+                thinker_local.to(DEVICE)
 
                 if torch.cuda.is_available():
                     try:
@@ -246,7 +252,7 @@ def load_model():
                     thinker_local.config.pad_token_id = processor.tokenizer.eos_token_id
 
                 thinker = thinker_local
-                logger.info(f"Thinker 模型載入完成（device={DEVICE}）")
+                logger.info(f"Thinker 模型載入完成（device={DEVICE.type}）")
 
     _touch()
     start_timeout_monitor()
@@ -548,6 +554,9 @@ def _transcribe_once(
         ]},
     ]
 
+    # 明確使用實際運算裝置（單卡模式下就是 DEVICE）
+    model_device = DEVICE
+
     inputs = proc.apply_chat_template(
         conversations,
         add_generation_prompt=True,
@@ -555,10 +564,10 @@ def _transcribe_once(
         return_dict=True,
         return_tensors="pt",
         padding=True
-    ).to(model.device)
+    ).to(model_device)
 
     # assistant prefill（不影響語意，只讓格式更穩）
-    inputs = _append_assistant_prefill(proc, model.device, inputs, "Transcript: ")
+    inputs = _append_assistant_prefill(proc, model_device, inputs, "Transcript: ")
 
     def _do_gen(mnt, mtime):
         return model.generate(
