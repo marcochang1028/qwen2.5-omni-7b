@@ -46,7 +46,7 @@ MODEL_NAME  = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-Omni-7B")
 HF_REVISION = os.getenv("HF_REVISION", "main")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ========== 服務/運行參數（與 Phi-4 對齊） ==========
+# ========== 服務/運行參數（支援多卡分散式） ==========
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))
 MAX_CONCURRENT_INFERENCES = int(os.getenv("MAX_CONCURRENT_INFERENCES", "2"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "512"))
@@ -182,11 +182,11 @@ def start_timeout_monitor():
         logger.info("監控執行緒已啟動")
 
 
-# ========= 模型載入（Lazy + 單卡上機）=========
+# ========= 模型載入（Lazy + 多卡支援）=========
 def load_model():
     """
     Lazy load Qwen2.5-Omni：
-    - 明確停用 device_map="auto"，整個模型放到單一裝置（GPU/CPU）
+    - 啟用 device_map="auto"，支援多卡分散式載入
     - 一次性 GPU 優化（TF32 / cudnn / eval / requires_grad=False）
     """
     global processor, thinker
@@ -215,8 +215,8 @@ def load_model():
                     token=HF_TOKEN,
                     trust_remote_code=True,
                     torch_dtype="auto",
-                    device_map=None,                # 關掉分片
-                    low_cpu_mem_usage=False,        # 避免殘留 meta 權重
+                    device_map="auto",              # 啟用多卡分散式載入
+                    low_cpu_mem_usage=True,         # 優化記憶體使用
                     attn_implementation="sdpa",
                 )
                 if HF_CACHE_DIR:
@@ -225,8 +225,7 @@ def load_model():
                     Qwen2_5OmniThinkerForConditionalGeneration, MODEL_NAME, **model_kwargs
                 )
 
-                # 明確上到目標裝置
-                thinker_local.to(DEVICE)
+                # 使用 device_map="auto" 時不需要手動 to(device)
 
                 if torch.cuda.is_available():
                     try:
@@ -252,7 +251,7 @@ def load_model():
                     thinker_local.config.pad_token_id = processor.tokenizer.eos_token_id
 
                 thinker = thinker_local
-                logger.info(f"Thinker 模型載入完成（device={DEVICE.type}）")
+                logger.info(f"Thinker 模型載入完成（device_map=auto，多卡分散式）")
 
     _touch()
     start_timeout_monitor()
@@ -480,10 +479,9 @@ def _cap_tokens_by_duration(sec: float, hard_cap: int) -> int:
 
 
 # ========= Qwen 生成工具 =========
-def _gen_ctx():
-    # 修正 deprecated：改用 torch.amp.autocast("cuda", ...)
-    if torch.cuda.is_available():
-        return torch.amp.autocast("cuda", dtype=torch.float16)
+def _gen_ctx(device=None):
+    # 關掉 autocast，讓模型使用 torch_dtype="auto" 設定的 dtype（最穩定的方案）
+    # Qwen2.5 系列常用 bfloat16，硬設 float16 可能降精度或遇到數值問題
     return nullcontext()
 
 def _safe_generate(generate_fn, max_new_tokens, max_time_s: Optional[float] = None, timeout_s: float = 60):
@@ -515,9 +513,10 @@ def _eos_ids(proc: Qwen2_5OmniProcessor) -> List[int]:
         ids.append(tok.eos_token_id)
     return list(dict.fromkeys(ids))
 
-def _append_assistant_prefill(proc, model_device, inputs_dict, prefill_text: str):
+def _append_assistant_prefill(proc, inputs_dict, prefill_text: str):
     tok = proc.tokenizer
-    pre_ids = tok.encode(prefill_text, add_special_tokens=False, return_tensors="pt").to(model_device)
+    # 讓 pre_ids 留在 CPU，與 inputs_dict 保持同一設備
+    pre_ids = tok.encode(prefill_text, add_special_tokens=False, return_tensors="pt")
     inputs_dict["input_ids"] = torch.cat([inputs_dict["input_ids"], pre_ids], dim=1)
     if "attention_mask" in inputs_dict:
         add_mask = torch.ones_like(pre_ids, dtype=inputs_dict["attention_mask"].dtype)
@@ -554,9 +553,7 @@ def _transcribe_once(
         ]},
     ]
 
-    # 明確使用實際運算裝置（單卡模式下就是 DEVICE）
-    model_device = DEVICE
-
+    # 多卡分片模式下，讓輸入留在 CPU，Transformers/Accelerate 會在 forward 時自動處理設備分配
     inputs = proc.apply_chat_template(
         conversations,
         add_generation_prompt=True,
@@ -564,10 +561,10 @@ def _transcribe_once(
         return_dict=True,
         return_tensors="pt",
         padding=True
-    ).to(model_device)
+    )
 
     # assistant prefill（不影響語意，只讓格式更穩）
-    inputs = _append_assistant_prefill(proc, model_device, inputs, "Transcript: ")
+    inputs = _append_assistant_prefill(proc, inputs, "Transcript: ")
 
     def _do_gen(mnt, mtime):
         return model.generate(
@@ -714,7 +711,7 @@ async def ready():
         "model_loaded": model_ready,
         "active_requests": active_count,
         "models_dir": HF_CACHE_DIR,
-        "device": DEVICE.type,
+        "device": "multi-gpu" if torch.cuda.device_count() > 1 else DEVICE.type,
         "timestamp": time.time(),
         "service": "qwen2.5-omni-asr"
     }
@@ -734,8 +731,9 @@ async def status():
         "max_concurrent_inferences": MAX_CONCURRENT_INFERENCES,
         "max_upload_mb": MAX_UPLOAD_MB,
         "cuda_available": torch.cuda.is_available(),
+        "cuda_device_count": torch.cuda.device_count(),
         "models_dir": HF_CACHE_DIR,
-        "device": DEVICE.type,
+        "device": "multi-gpu" if torch.cuda.device_count() > 1 else DEVICE.type,
         "timestamp": time.time(),
         "service": "qwen2.5-omni-asr"
     }
