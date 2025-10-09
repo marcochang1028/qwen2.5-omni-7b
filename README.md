@@ -81,7 +81,7 @@ git pull origin main
 1. 用以下指令停掉container
 docker stop qwen25-asr 
 2. 進到docker目錄後執行以下構建image的指令
-docker build -t qwen2.5-omni-7b -f Dockerfile ..
+docker build -t pgi-asr-2 -f Dockerfile ..
 3. 執行以下指令確認image成功建立
 docker images
 4. 執行以下指令刪除舊的image
